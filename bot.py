@@ -102,29 +102,34 @@ async def request_forward(message_id: int, from_chat: int, topic_url: str) -> bo
 async def get_topics() -> list[dict]:
     if not USERBOT_URL:
         return []
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{USERBOT_URL}/topics",
-                params={"secret": INTERNAL_SECRET, "group_id": SOURCE_GROUP},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                data = await resp.json()
-
-        topics = []
-        for t in data.get("topics", []):
-            parsed = parse_topic_name(t.get("title", ""))
-            if parsed:
-                topics.append({
-                    "id":    t["id"],
-                    "name":  t["title"],
-                    "url":   parsed["url"],
-                    "hours": parsed["hours"],
-                })
-        return topics
-    except Exception as e:
-        log.error(f"Topiclar yuklanmadi: {e}")
-        return []
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{USERBOT_URL}/topics",
+                    params={"secret": INTERNAL_SECRET, "group_id": SOURCE_GROUP},
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    if resp.status == 502:
+                        log.warning(f"Userbot uyg'onmoqda... ({attempt+1}/3)")
+                        await asyncio.sleep(15)
+                        continue
+                    data = await resp.json()
+            topics = []
+            for t in data.get("topics", []):
+                parsed = parse_topic_name(t.get("title", ""))
+                if parsed:
+                    topics.append({
+                        "id":    t["id"],
+                        "name":  t["title"],
+                        "url":   parsed["url"],
+                        "hours": parsed["hours"],
+                    })
+            return topics
+        except Exception as e:
+            log.error(f"Topiclar yuklanmadi ({attempt+1}/3): {e}")
+            await asyncio.sleep(10)
+    return []
 
 
 # ── Topicdan elonlarni olish ────────────────────────────────────────────────
@@ -303,9 +308,31 @@ async def on_delete_topic(callback: CallbackQuery):
 scheduler_state: dict[int, dict] = {}
 
 
+async def wake_userbot():
+    """Userbot uxlab qolgan bo'lsa uyg'otadi."""
+    if not USERBOT_URL:
+        return
+    for attempt in range(10):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{USERBOT_URL}/health",
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        log.info("Userbot uyg'ondi ✓")
+                        return
+        except Exception:
+            pass
+        log.info(f"Userbot uyg'onishini kutmoqda... ({attempt+1}/10)")
+        await asyncio.sleep(10)
+    log.error("Userbot uyg'onmadi!")
+
+
 async def scheduler_loop():
     log.info("Scheduler ishga tushdi")
     await asyncio.sleep(10)
+    await wake_userbot()
 
     while True:
         try:
