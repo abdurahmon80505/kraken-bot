@@ -384,3 +384,29 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# ── SIGTERM override ──────────────────────────────────────────────────────────
+# Yuqoridagi main ni override qilamiz — auto-restart bilan
+import signal as _signal
+
+_original_main = main
+
+async def main():
+    log.info("Bot ishga tushmoqda (auto-restart rejimi)...")
+    await start_health_server()
+    asyncio.create_task(scheduler_loop())
+
+    while True:
+        try:
+            log.info("Polling boshlandi...")
+            await dp.start_polling(bot, handle_signals=False)
+        except Exception as e:
+            log.error(f"Polling xatosi: {e} — 5 soniyadan keyin qayta urinadi")
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    def _sigterm(*a):
+        log.warning("SIGTERM keldi — davom etadi...")
+    _signal.signal(_signal.SIGTERM, _sigterm)
+    asyncio.run(main())
