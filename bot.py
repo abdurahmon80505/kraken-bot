@@ -1,17 +1,18 @@
 """
-Kraken Mobile — Bot
+Kraken Mobile — Bot (SODDALASHTIRILGAN)
 Vazifasi:
-  1. SOURCE_GROUP dagi topic nomlarini o'qiydi
-     Format: "📱 Nomi | https://t.me/Target/123 | 12"  (soat)
-             "📱 Nomi | https://t.me/Target/123 | 2d"  (kun)
-  2. O'sha topicga tashlangan elonlarni interval bo'yicha target ga yuboradi
-  3. /vazifalar — barcha topiclarni ko'rsatadi (elon + Delete tugmasi)
+  * SOURCE_GROUP (baza guruh) dagi topic nomlarini o'qiydi
+    Format: "Nomi | https://t.me/Target/123 | 12"  (soat)
+            "https://t.me/Target/123 | 2d"         (kun, nomsiz ham bo'ladi)
+  * Har topic dagi elonlarni interval bo'yicha AVTOMATIK target ga forward qiladi
+    (forward'ni userbot bajaradi — premium emoji saqlanadi)
 
-Tuzatildi:
-  * Qo'sh main() olib tashlandi — bitta toza main
-  * Keep-alive: bot o'zini VA userbot ni har 10 daqiqada band tutadi
-  * Userbot uxlab qolsa avtomatik uyg'otadi
-  * Scheduler — userbot 502 bo'lsa kutadi, qayta uriadi
+  /start  — yordam
+  /status — bot va userbot holati, oxirgi yuborilgan vaqtlar
+
+ESLATMA: /vazifalar olib tashlandi — baza guruhni o'zingiz ko'rasiz.
+         Bot endi guruhdan xabar forward qilmaydi, faqat userbotga buyruq beradi.
+         Shu sababli "message to forward not found" xatosi endi yo'q.
 """
 
 import asyncio
@@ -23,14 +24,9 @@ from datetime import datetime
 
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +42,6 @@ SOURCE_GROUP    = int(os.environ["SOURCE_GROUP"])
 USERBOT_URL     = os.environ.get("USERBOT_URL", "").rstrip("/")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 PORT            = int(os.environ.get("PORT", 8081))
-# O'zining tashqi URL i (keep-alive uchun). Render avtomatik beradi.
 SELF_URL        = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 bot = Bot(token=BOT_TOKEN)
@@ -71,10 +66,13 @@ def parse_topic_name(name: str):
 
 
 # ── Userbot ga forward so'rovi ──────────────────────────────────────────────
-async def request_forward(message_id: int, from_chat: int, topic_url: str) -> bool:
+async def request_forward(message_id: int, from_chat: int, topic_url: str):
+    """
+    Userbot ga POST /forward yuboradi.
+    Qaytaradi: (True, None) yoki (False, "xato matni")
+    """
     if not USERBOT_URL:
-        log.error("USERBOT_URL ENV o'rnatilmagan!")
-        return False
+        return False, "USERBOT_URL yo'q"
 
     payload = {
         "message_id": message_id,
@@ -91,16 +89,14 @@ async def request_forward(message_id: int, from_chat: int, topic_url: str) -> bo
             ) as resp:
                 result = await resp.json()
         if result.get("ok"):
-            return True
-        log.error(f"Forward xatosi: {result.get('error')}")
-        return False
+            return True, None
+        return False, result.get("error", "noma'lum xato")
     except Exception as e:
-        log.error(f"Userbot bilan bog'lanib bo'lmadi: {e}")
-        return False
+        return False, str(e)
 
 
 # ── Guruhdan topiclarni olish (502 bo'lsa kutadi) ───────────────────────────
-async def get_topics() -> list:
+async def get_topics():
     if not USERBOT_URL:
         return []
     for attempt in range(4):
@@ -134,7 +130,7 @@ async def get_topics() -> list:
 
 
 # ── Topicdan elonlarni olish ────────────────────────────────────────────────
-async def get_topic_messages(topic_id: int) -> list:
+async def get_topic_messages(topic_id: int):
     if not USERBOT_URL:
         return []
     try:
@@ -162,12 +158,12 @@ async def cmd_start(message: Message):
         return
     await message.answer(
         "👋 <b>Kraken Bot</b>\n\n"
-        "Guruhingizda topiclar yarating:\n"
-        "<code>📱 Smartfonlar | https://t.me/Target/123 | 12</code>\n"
-        "<code>💻 Noutbuklar | https://t.me/Target/456 | 2d</code>\n\n"
-        "<b>Komandalar:</b>\n"
-        "/vazifalar — barcha aktiv topiclar\n"
-        "/status — bot holati",
+        "Baza guruhingizda topic yarating, nomiga manzil va interval yozing:\n"
+        "<code>📱 Smartfonlar | https://t.me/Target/123 | 12</code>  (12 soat)\n"
+        "<code>https://t.me/Target/456 | 2d</code>  (2 kun, nomsiz ham bo'ladi)\n\n"
+        "So'ng o'sha topicga elon tashlang — bot interval bo'yicha avtomatik "
+        "target guruhga forward qiladi.\n\n"
+        "/status — holatni ko'rish",
         parse_mode="HTML"
     )
 
@@ -178,33 +174,50 @@ async def cmd_status(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
-    userbot_status = "❓"
-    if USERBOT_URL:
+    # Userbot holati
+    userbot_status = "❌ Ulanmayapti"
+    if not USERBOT_URL:
+        userbot_status = "❌ USERBOT_URL yo'q"
+    else:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{USERBOT_URL}/health",
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
-                    userbot_status = "✅ Ishlayapti" if resp.status == 200 else "❌ Xato"
+                    if resp.status == 200:
+                        userbot_status = "✅ Ishlayapti"
         except Exception:
-            userbot_status = "❌ Ulanmayapti"
-    else:
-        userbot_status = "❌ USERBOT_URL yo'q"
+            pass
 
     topics = await get_topics()
 
-    # Scheduler holati
     lines = []
     for t in topics:
+        msgs = await get_topic_messages(t["id"])
+        hours = t["hours"]
+        interval_str = f"{hours // 24} kun" if hours % 24 == 0 else f"{hours} soat"
+
         st = scheduler_state.get(t["id"])
         if st and st.get("last_time"):
             last = datetime.fromtimestamp(st["last_time"]).strftime("%d/%m %H:%M")
+            nxt_ts = st["last_time"] + hours * 3600
+            nxt = datetime.fromtimestamp(nxt_ts).strftime("%d/%m %H:%M")
         else:
             last = "hali yo'q"
-        lines.append(f"• {t['name'][:25]} — oxirgi: {last}")
+            nxt  = "tez orada"
 
-    detail = "\n".join(lines) if lines else "—"
+        name = t["name"]
+        if len(name) > 30:
+            name = name[:30] + "…"
+
+        lines.append(
+            f"📌 <b>{name}</b>\n"
+            f"   📝 {len(msgs)} ta elon · ⏱ {interval_str}\n"
+            f"   🕐 oxirgi: {last} · keyingi: {nxt}"
+        )
+
+    detail = "\n\n".join(lines) if lines else "<i>Aktiv topic yo'q</i>"
 
     await message.answer(
         f"📊 <b>Bot holati</b>\n\n"
@@ -215,115 +228,11 @@ async def cmd_status(message: Message):
     )
 
 
-# ── /vazifalar ──────────────────────────────────────────────────────────────
-@router.message(Command("vazifalar"))
-async def cmd_vazifalar(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    await message.answer("⏳ Topiclar yuklanmoqda...")
-
-    topics = await get_topics()
-    if not topics:
-        await message.answer(
-            "📭 Aktiv topic topilmadi.\n\n"
-            "Topic nomini shunday yozing:\n"
-            "<code>📱 Smartfonlar | https://t.me/Target/123 | 12</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    for topic in topics:
-        messages = await get_topic_messages(topic["id"])
-
-        hours = topic["hours"]
-        interval_str = f"{hours // 24} kun" if hours % 24 == 0 else f"{hours} soat"
-
-        header = (
-            f"📌 <b>{topic['name']}</b>\n"
-            f"📤 {topic['url']}\n"
-            f"⏱ Interval: {interval_str}\n"
-            f"📝 Elonlar: {len(messages)} ta\n"
-        )
-
-        if not messages:
-            await message.answer(
-                header + "\n<i>Elon yo'q</i>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(
-                        text="🗑 Topicni o'chirish",
-                        callback_data=f"del_topic:{topic['id']}"
-                    )
-                ]])
-            )
-            continue
-
-        await message.answer(header, parse_mode="HTML")
-
-        for i, msg in enumerate(messages):
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="🗑 O'chirish",
-                    callback_data=f"del_msg:{SOURCE_GROUP}:{msg['message_id']}:{topic['id']}"
-                )
-            ]])
-
-            try:
-                await bot.forward_message(
-                    chat_id=ADMIN_ID,
-                    from_chat_id=SOURCE_GROUP,
-                    message_id=msg["message_id"],
-                )
-                await bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"☝️ Elon #{i+1}",
-                    reply_markup=keyboard,
-                )
-            except Exception as e:
-                await message.answer(f"❌ Elon #{i+1} yuklanmadi: {e}", reply_markup=keyboard)
-
-            await asyncio.sleep(0.5)
-
-
-# ── O'chirish tugmasi (elon) ─────────────────────────────────────────────────
-@router.callback_query(F.data.startswith("del_msg:"))
-async def on_delete_message(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Ruxsat yo'q")
-        return
-
-    parts      = callback.data.split(":")
-    group_id   = int(parts[1])
-    message_id = int(parts[2])
-    topic_id   = int(parts[3])
-
-    try:
-        await bot.delete_message(chat_id=group_id, message_id=message_id)
-        await callback.message.delete()
-        await callback.answer("✅ Elon o'chirildi")
-        log.info(f"Elon o'chirildi: msg#{message_id} topic#{topic_id}")
-    except Exception as e:
-        await callback.answer(f"❌ O'chirib bo'lmadi: {e}", show_alert=True)
-
-
-# ── O'chirish tugmasi (topic) ────────────────────────────────────────────────
-@router.callback_query(F.data.startswith("del_topic:"))
-async def on_delete_topic(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Ruxsat yo'q")
-        return
-
-    await callback.message.delete()
-    await callback.answer("ℹ️ Topicni guruhdan o'chiring yoki nomini o'zgartiring")
-
-
-# ── SCHEDULER ─────────────────────────────────────────────────────────────────
+# ── SCHEDULER — avtomatik yuborish (asosiy ish) ──────────────────────────────
 scheduler_state: dict = {}
 
 
 async def wake_userbot():
-    """Userbot uxlab qolgan bo'lsa uyg'otadi."""
     if not USERBOT_URL:
         return False
     for attempt in range(12):
@@ -362,23 +271,24 @@ async def scheduler_loop():
                 last_time = state.get("last_time", 0)
 
                 if now - last_time < interval:
-                    continue
+                    continue  # Hali vaqti kelmadi
 
                 messages = await get_topic_messages(tid)
                 if not messages:
-                    continue
+                    continue  # Bu topicda elon yo'q
 
+                # Navbatdagi elonni tanlash (rotatsiya: 1, 2, 3, 1, 2, 3...)
                 last_idx = state.get("last_sent_index", -1)
                 next_idx = (last_idx + 1) % len(messages)
                 msg      = messages[next_idx]
 
-                success = await request_forward(
+                ok, err = await request_forward(
                     message_id=msg["message_id"],
                     from_chat=SOURCE_GROUP,
                     topic_url=topic["url"],
                 )
 
-                if success:
+                if ok:
                     scheduler_state[tid] = {"last_sent_index": next_idx, "last_time": now}
                     log.info(f"✅ Topic#{tid} → {topic['url']} | elon#{next_idx+1}/{len(messages)}")
                     try:
@@ -386,31 +296,34 @@ async def scheduler_loop():
                             ADMIN_ID,
                             f"✅ Yuborildi: <b>{topic['name']}</b>\n"
                             f"📤 {topic['url']}\n"
-                            f"🕐 {datetime.now().strftime('%H:%M')}",
+                            f"📝 elon #{next_idx+1}/{len(messages)}\n"
+                            f"🕐 {datetime.now().strftime('%d/%m %H:%M')}",
                             parse_mode="HTML"
                         )
                     except Exception:
                         pass
                 else:
-                    log.error(f"❌ Topic#{tid} forward xatosi")
+                    log.error(f"❌ Topic#{tid} forward xatosi: {err}")
+                    # last_time ni yangilamaymiz — keyingi siklda qayta uriadi
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"❌ <b>{topic['name']}</b> yuborilmadi:\n<code>{err}</code>",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
 
         except Exception as e:
             log.error(f"Scheduler xatosi: {e}")
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(60)  # Har daqiqada tekshir
 
 
 # ── KEEP-ALIVE — bot + userbot uxlamasligi uchun ──────────────────────────────
 async def keepalive_loop():
-    """
-    Har 10 daqiqada:
-      1. Userbot /health ni ping — userbot uxlamaydi.
-      2. O'zining SELF_URL ini ping — bot ham uxlamaydi
-         (Render web service 15 daqiqada uxlaydi, shuning oldini olamiz).
-    """
     await asyncio.sleep(30)
     while True:
-        # Userbot ni band tut
         if USERBOT_URL:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -422,7 +335,6 @@ async def keepalive_loop():
             except Exception as e:
                 log.warning(f"Keep-alive userbot xato: {e}")
 
-        # O'zini band tut
         if SELF_URL:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -437,7 +349,7 @@ async def keepalive_loop():
         await asyncio.sleep(600)  # 10 daqiqa
 
 
-# ── Health server (Render uchun + keep-alive) ────────────────────────────────
+# ── Health server (Render uchun) ─────────────────────────────────────────────
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "bot": "kraken-bot"})
 
@@ -453,9 +365,9 @@ async def start_health_server():
     log.info(f"Health server: port {PORT}")
 
 
-# ── Main (bitta, toza, auto-restart bilan) ───────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("Bot ishga tushmoqda (auto-restart rejimi)...")
+    log.info("Bot ishga tushmoqda...")
     await start_health_server()
     asyncio.create_task(scheduler_loop())
     asyncio.create_task(keepalive_loop())
