@@ -1,11 +1,17 @@
 """
 Kraken Mobile — Bot
 Vazifasi:
-  1. Admin guruhidagi topic nomlarini o'qiydi
+  1. SOURCE_GROUP dagi topic nomlarini o'qiydi
      Format: "📱 Nomi | https://t.me/Target/123 | 12"  (soat)
              "📱 Nomi | https://t.me/Target/123 | 2d"  (kun)
   2. O'sha topicga tashlangan elonlarni interval bo'yicha target ga yuboradi
   3. /vazifalar — barcha topiclarni ko'rsatadi (elon + Delete tugmasi)
+
+Tuzatildi:
+  * Qo'sh main() olib tashlandi — bitta toza main
+  * Keep-alive: bot o'zini VA userbot ni har 10 daqiqada band tutadi
+  * Userbot uxlab qolsa avtomatik uyg'otadi
+  * Scheduler — userbot 502 bo'lsa kutadi, qayta uriadi
 """
 
 import asyncio
@@ -37,9 +43,11 @@ log = logging.getLogger(__name__)
 BOT_TOKEN       = os.environ["BOT_TOKEN"]
 ADMIN_ID        = int(os.environ["ADMIN_ID"])
 SOURCE_GROUP    = int(os.environ["SOURCE_GROUP"])
-USERBOT_URL     = os.environ.get("USERBOT_URL", "")
+USERBOT_URL     = os.environ.get("USERBOT_URL", "").rstrip("/")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 PORT            = int(os.environ.get("PORT", 8081))
+# O'zining tashqi URL i (keep-alive uchun). Render avtomatik beradi.
+SELF_URL        = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -47,12 +55,12 @@ router = Router()
 dp.include_router(router)
 
 # ── Topic nom parser ────────────────────────────────────────────────────────
-TOPIC_RE = re.compile(
-    r"\|\s*(https://t\.me/[^\s|]+)\s*\|\s*(\d+)(d?)\s*$"
-)
+# Linkdan oldingi "|" ixtiyoriy — "Nom | link | vaqt" ham, "link | vaqt" ham ishlaydi
+TOPIC_RE = re.compile(r"(https://t\.me/[^\s|]+)\s*\|\s*(\d+)(d?)\s*$")
 
-def parse_topic_name(name: str) -> dict | None:
-    m = TOPIC_RE.search(name)
+
+def parse_topic_name(name: str):
+    m = TOPIC_RE.search(name or "")
     if not m:
         return None
     url    = m.group(1)
@@ -60,13 +68,6 @@ def parse_topic_name(name: str) -> dict | None:
     is_day = m.group(3) == "d"
     hours  = num * 24 if is_day else num
     return {"url": url, "hours": hours}
-
-
-def parse_topic_url(url: str):
-    m = re.match(r"https?://t\.me/([^/]+)/(\d+)", url)
-    if m:
-        return "@" + m.group(1), int(m.group(2))
-    return None, None
 
 
 # ── Userbot ga forward so'rovi ──────────────────────────────────────────────
@@ -86,7 +87,7 @@ async def request_forward(message_id: int, from_chat: int, topic_url: str) -> bo
             async with session.post(
                 f"{USERBOT_URL}/forward",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=40),
             ) as resp:
                 result = await resp.json()
         if result.get("ok"):
@@ -98,11 +99,11 @@ async def request_forward(message_id: int, from_chat: int, topic_url: str) -> bo
         return False
 
 
-# ── Guruhdan topiclarni olish ───────────────────────────────────────────────
-async def get_topics() -> list[dict]:
+# ── Guruhdan topiclarni olish (502 bo'lsa kutadi) ───────────────────────────
+async def get_topics() -> list:
     if not USERBOT_URL:
         return []
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -110,8 +111,8 @@ async def get_topics() -> list[dict]:
                     params={"secret": INTERNAL_SECRET, "group_id": SOURCE_GROUP},
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as resp:
-                    if resp.status == 502:
-                        log.warning(f"Userbot uyg'onmoqda... ({attempt+1}/3)")
+                    if resp.status in (502, 503):
+                        log.warning(f"Userbot uyg'onmoqda... ({attempt+1}/4)")
                         await asyncio.sleep(15)
                         continue
                     data = await resp.json()
@@ -127,13 +128,13 @@ async def get_topics() -> list[dict]:
                     })
             return topics
         except Exception as e:
-            log.error(f"Topiclar yuklanmadi ({attempt+1}/3): {e}")
+            log.error(f"Topiclar yuklanmadi ({attempt+1}/4): {e}")
             await asyncio.sleep(10)
     return []
 
 
 # ── Topicdan elonlarni olish ────────────────────────────────────────────────
-async def get_topic_messages(topic_id: int) -> list[dict]:
+async def get_topic_messages(topic_id: int) -> list:
     if not USERBOT_URL:
         return []
     try:
@@ -145,7 +146,7 @@ async def get_topic_messages(topic_id: int) -> list[dict]:
                     "group_id": SOURCE_GROUP,
                     "topic_id": topic_id,
                 },
-                timeout=aiohttp.ClientTimeout(total=15),
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 data = await resp.json()
         return data.get("messages", [])
@@ -183,7 +184,7 @@ async def cmd_status(message: Message):
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{USERBOT_URL}/health",
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     userbot_status = "✅ Ishlayapti" if resp.status == 200 else "❌ Xato"
         except Exception:
@@ -193,10 +194,23 @@ async def cmd_status(message: Message):
 
     topics = await get_topics()
 
+    # Scheduler holati
+    lines = []
+    for t in topics:
+        st = scheduler_state.get(t["id"])
+        if st and st.get("last_time"):
+            last = datetime.fromtimestamp(st["last_time"]).strftime("%d/%m %H:%M")
+        else:
+            last = "hali yo'q"
+        lines.append(f"• {t['name'][:25]} — oxirgi: {last}")
+
+    detail = "\n".join(lines) if lines else "—"
+
     await message.answer(
         f"📊 <b>Bot holati</b>\n\n"
         f"🤖 Userbot: {userbot_status}\n"
-        f"📋 Aktiv topiclar: {len(topics)} ta",
+        f"📋 Aktiv topiclar: {len(topics)} ta\n\n"
+        f"{detail}",
         parse_mode="HTML"
     )
 
@@ -305,28 +319,29 @@ async def on_delete_topic(callback: CallbackQuery):
 
 
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────
-scheduler_state: dict[int, dict] = {}
+scheduler_state: dict = {}
 
 
 async def wake_userbot():
     """Userbot uxlab qolgan bo'lsa uyg'otadi."""
     if not USERBOT_URL:
-        return
-    for attempt in range(10):
+        return False
+    for attempt in range(12):
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{USERBOT_URL}/health",
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 200:
-                        log.info("Userbot uyg'ondi ✓")
-                        return
+                        log.info("Userbot uyg'oq ✓")
+                        return True
         except Exception:
             pass
-        log.info(f"Userbot uyg'onishini kutmoqda... ({attempt+1}/10)")
+        log.info(f"Userbot uyg'onishini kutmoqda... ({attempt+1}/12)")
         await asyncio.sleep(10)
     log.error("Userbot uyg'onmadi!")
+    return False
 
 
 async def scheduler_loop():
@@ -364,18 +379,18 @@ async def scheduler_loop():
                 )
 
                 if success:
-                    scheduler_state[tid] = {
-                        "last_sent_index": next_idx,
-                        "last_time": now,
-                    }
+                    scheduler_state[tid] = {"last_sent_index": next_idx, "last_time": now}
                     log.info(f"✅ Topic#{tid} → {topic['url']} | elon#{next_idx+1}/{len(messages)}")
-                    await bot.send_message(
-                        ADMIN_ID,
-                        f"✅ Yuborildi: <b>{topic['name']}</b>\n"
-                        f"📤 {topic['url']}\n"
-                        f"🕐 {datetime.now().strftime('%H:%M')}",
-                        parse_mode="HTML"
-                    )
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"✅ Yuborildi: <b>{topic['name']}</b>\n"
+                            f"📤 {topic['url']}\n"
+                            f"🕐 {datetime.now().strftime('%H:%M')}",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
                 else:
                     log.error(f"❌ Topic#{tid} forward xatosi")
 
@@ -385,7 +400,44 @@ async def scheduler_loop():
         await asyncio.sleep(60)
 
 
-# ── Health check server (Render uchun) ────────────────────────────────────────
+# ── KEEP-ALIVE — bot + userbot uxlamasligi uchun ──────────────────────────────
+async def keepalive_loop():
+    """
+    Har 10 daqiqada:
+      1. Userbot /health ni ping — userbot uxlamaydi.
+      2. O'zining SELF_URL ini ping — bot ham uxlamaydi
+         (Render web service 15 daqiqada uxlaydi, shuning oldini olamiz).
+    """
+    await asyncio.sleep(30)
+    while True:
+        # Userbot ni band tut
+        if USERBOT_URL:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{USERBOT_URL}/health",
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        log.info(f"Keep-alive userbot: {resp.status}")
+            except Exception as e:
+                log.warning(f"Keep-alive userbot xato: {e}")
+
+        # O'zini band tut
+        if SELF_URL:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{SELF_URL}/health",
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        log.info(f"Keep-alive self: {resp.status}")
+            except Exception as e:
+                log.warning(f"Keep-alive self xato: {e}")
+
+        await asyncio.sleep(600)  # 10 daqiqa
+
+
+# ── Health server (Render uchun + keep-alive) ────────────────────────────────
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "bot": "kraken-bot"})
 
@@ -401,28 +453,12 @@ async def start_health_server():
     log.info(f"Health server: port {PORT}")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-async def main():
-    log.info("Bot ishga tushmoqda...")
-    await start_health_server()
-    asyncio.create_task(scheduler_loop())
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
-# ── SIGTERM override ──────────────────────────────────────────────────────────
-# Yuqoridagi main ni override qilamiz — auto-restart bilan
-import signal as _signal
-
-_original_main = main
-
+# ── Main (bitta, toza, auto-restart bilan) ───────────────────────────────────
 async def main():
     log.info("Bot ishga tushmoqda (auto-restart rejimi)...")
     await start_health_server()
     asyncio.create_task(scheduler_loop())
+    asyncio.create_task(keepalive_loop())
 
     while True:
         try:
@@ -432,8 +468,6 @@ async def main():
             log.error(f"Polling xatosi: {e} — 5 soniyadan keyin qayta urinadi")
             await asyncio.sleep(5)
 
+
 if __name__ == "__main__":
-    def _sigterm(*a):
-        log.warning("SIGTERM keldi — davom etadi...")
-    _signal.signal(_signal.SIGTERM, _sigterm)
     asyncio.run(main())
