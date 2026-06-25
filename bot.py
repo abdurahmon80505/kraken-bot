@@ -50,19 +50,31 @@ router = Router()
 dp.include_router(router)
 
 # ── Topic nom parser ────────────────────────────────────────────────────────
-# Linkdan oldingi "|" ixtiyoriy — "Nom | link | vaqt" ham, "link | vaqt" ham ishlaydi
-TOPIC_RE = re.compile(r"(https://t\.me/[^\s|]+)\s*\|\s*(\d+)(d?)\s*$")
+# Format:  Nom | https://t.me/Target/123 | 1d | 16:00
+#   * "1d"  = har 1 kunda (3d = har 3 kunda). Faqat "1" yozilsa ham 1 kun.
+#   * "16:00" = Tashkent vaqti (UTC+5) bilan har kungi yuborish soati.
+# Vaqt yozilmasa — default 09:00. Eski "| 1d" format ham ishlaydi.
+TOPIC_RE = re.compile(
+    r"(https://t\.me/[^\s|]+)\s*\|\s*(\d+)\s*d?\s*(?:\|\s*(\d{1,2}):(\d{2}))?\s*$"
+)
 
 
 def parse_topic_name(name: str):
     m = TOPIC_RE.search(name or "")
     if not m:
         return None
-    url    = m.group(1)
-    num    = int(m.group(2))
-    is_day = m.group(3) == "d"
-    hours  = num * 24 if is_day else num
-    return {"url": url, "hours": hours}
+    url  = m.group(1)
+    days = int(m.group(2))
+    if days < 1:
+        days = 1
+    if m.group(3) is not None:
+        hh = int(m.group(3))
+        mm = int(m.group(4))
+        if hh > 23 or mm > 59:
+            hh, mm = 9, 0
+    else:
+        hh, mm = 9, 0
+    return {"url": url, "days": days, "hh": hh, "mm": mm}
 
 
 # ── Userbot ga forward so'rovi ──────────────────────────────────────────────
@@ -117,10 +129,12 @@ async def get_topics():
                 parsed = parse_topic_name(t.get("title", ""))
                 if parsed:
                     topics.append({
-                        "id":    t["id"],
-                        "name":  t["title"],
-                        "url":   parsed["url"],
-                        "hours": parsed["hours"],
+                        "id":   t["id"],
+                        "name": t["title"],
+                        "url":  parsed["url"],
+                        "days": parsed["days"],
+                        "hh":   parsed["hh"],
+                        "mm":   parsed["mm"],
                     })
             return topics
         except Exception as e:
@@ -158,11 +172,14 @@ async def cmd_start(message: Message):
         return
     await message.answer(
         "👋 <b>Kraken Bot</b>\n\n"
-        "Baza guruhingizda topic yarating, nomiga manzil va interval yozing:\n"
-        "<code>📱 Smartfonlar | https://t.me/Target/123 | 12</code>  (12 soat)\n"
-        "<code>https://t.me/Target/456 | 2d</code>  (2 kun, nomsiz ham bo'ladi)\n\n"
-        "So'ng o'sha topicga elon tashlang — bot interval bo'yicha avtomatik "
-        "target guruhga forward qiladi.\n\n"
+        "Baza guruhda topic yarating. Topic nomiga: manzil | kun | soat\n\n"
+        "<code>📱 Smartfonlar | https://t.me/Target/123 | 1d | 16:00</code>\n"
+        "<code>💻 Noutbuklar | https://t.me/Target/456 | 3d | 09:30</code>\n\n"
+        "Ya'ni:\n"
+        "• <b>1d</b> = har kuni, <b>3d</b> = har 3 kunda\n"
+        "• <b>16:00</b> = Tashkent vaqti bilan yuborish soati\n\n"
+        "Bot har kuni o'sha soatda topicdagi <b>hamma elonni</b> target "
+        "guruhga forward qiladi.\n\n"
         "/status — holatni ko'rish",
         parse_mode="HTML"
     )
@@ -195,17 +212,15 @@ async def cmd_status(message: Message):
     lines = []
     for t in topics:
         msgs = await get_topic_messages(t["id"])
-        hours = t["hours"]
-        interval_str = f"{hours // 24} kun" if hours % 24 == 0 else f"{hours} soat"
+        days = t["days"]
+        interval_str = "har kuni" if days == 1 else f"har {days} kun"
+        time_str = f"{t['hh']:02d}:{t['mm']:02d}"
 
         st = scheduler_state.get(t["id"])
         if st and st.get("last_time"):
-            last = datetime.fromtimestamp(st["last_time"]).strftime("%d/%m %H:%M")
-            nxt_ts = st["last_time"] + hours * 3600
-            nxt = datetime.fromtimestamp(nxt_ts).strftime("%d/%m %H:%M")
+            last = datetime.utcfromtimestamp(st["last_time"] + 5*3600).strftime("%d/%m %H:%M")
         else:
             last = "hali yo'q"
-            nxt  = "tez orada"
 
         name = t["name"]
         if len(name) > 30:
@@ -213,14 +228,14 @@ async def cmd_status(message: Message):
 
         lines.append(
             f"📌 <b>{name}</b>\n"
-            f"   📝 {len(msgs)} ta elon · ⏱ {interval_str}\n"
-            f"   🕐 oxirgi: {last} · keyingi: {nxt}"
+            f"   📝 {len(msgs)} ta elon · ⏱ {interval_str} soat {time_str}\n"
+            f"   🕐 oxirgi: {last}"
         )
 
     detail = "\n\n".join(lines) if lines else "<i>Aktiv topic yo'q</i>"
 
     await message.answer(
-        f"📊 <b>Bot holati</b>\n\n"
+        f"📊 <b>Bot holati</b> (Tashkent vaqti)\n\n"
         f"🤖 Userbot: {userbot_status}\n"
         f"📋 Aktiv topiclar: {len(topics)} ta\n\n"
         f"{detail}",
@@ -258,66 +273,87 @@ async def scheduler_loop():
     await asyncio.sleep(10)
     await wake_userbot()
 
+    # Tashkent vaqti = UTC + 5 soat
+    TASHKENT_OFFSET = 5 * 3600
+
     while True:
         try:
             topics = await get_topics()
+            now = time.time()
+            # Hozirgi Tashkent vaqti
+            tk_now = datetime.utcfromtimestamp(now + TASHKENT_OFFSET)
 
             for topic in topics:
-                tid      = topic["id"]
-                interval = topic["hours"] * 3600
+                tid  = topic["id"]
+                days = topic["days"]
+                hh   = topic["hh"]
+                mm   = topic["mm"]
 
-                state     = scheduler_state.get(tid, {"last_sent_index": -1, "last_time": 0})
-                now       = time.time()
+                state     = scheduler_state.get(tid, {"last_time": 0})
                 last_time = state.get("last_time", 0)
 
-                if now - last_time < interval:
-                    continue  # Hali vaqti kelmadi
+                # 1) Hozir belgilangan SOAT-DAQIQA keldimi? (Tashkent bo'yicha)
+                #    1 daqiqalik oyna: hh:mm ga teng bo'lsa.
+                if not (tk_now.hour == hh and tk_now.minute == mm):
+                    continue
 
+                # 2) Oxirgi yuborishdan kamida (days) kun o'tdimi?
+                #    days*24 soatdan biroz kam (23.5 soat) — bir kunda 2 marta
+                #    yubormaslik uchun, lekin keyingi kun o'sha soatda o'tkazib
+                #    yubormaslik uchun.
+                min_gap = days * 24 * 3600 - 1800  # yarim soat zahira
+                if now - last_time < min_gap:
+                    continue  # Bu davrda allaqachon yuborilgan
+
+                # 3) Bu topicdagi HAMMA elonni olamiz
                 messages = await get_topic_messages(tid)
                 if not messages:
-                    continue  # Bu topicda elon yo'q
+                    continue
 
-                # Navbatdagi elonni tanlash (rotatsiya: 1, 2, 3, 1, 2, 3...)
-                last_idx = state.get("last_sent_index", -1)
-                next_idx = (last_idx + 1) % len(messages)
-                msg      = messages[next_idx]
+                log.info(f"⏰ Topic#{tid} vaqti keldi ({hh:02d}:{mm:02d}) — {len(messages)} ta elon yuborilmoqda")
 
-                ok, err = await request_forward(
-                    message_id=msg["message_id"],
-                    from_chat=SOURCE_GROUP,
-                    topic_url=topic["url"],
-                )
+                sent = 0
+                failed = 0
+                last_err = None
+                for idx, msg in enumerate(messages):
+                    ok, err = await request_forward(
+                        message_id=msg["message_id"],
+                        from_chat=SOURCE_GROUP,
+                        topic_url=topic["url"],
+                    )
+                    if ok:
+                        sent += 1
+                        log.info(f"  ✅ {idx+1}/{len(messages)} → {topic['url']}")
+                    else:
+                        failed += 1
+                        last_err = err
+                        log.error(f"  ❌ {idx+1}/{len(messages)}: {err}")
+                    # Telegram flood limitiga urilmaslik uchun har elon orasida pauza
+                    await asyncio.sleep(3)
 
-                if ok:
-                    scheduler_state[tid] = {"last_sent_index": next_idx, "last_time": now}
-                    log.info(f"✅ Topic#{tid} → {topic['url']} | elon#{next_idx+1}/{len(messages)}")
-                    try:
-                        await bot.send_message(
-                            ADMIN_ID,
-                            f"✅ Yuborildi: <b>{topic['name']}</b>\n"
-                            f"📤 {topic['url']}\n"
-                            f"📝 elon #{next_idx+1}/{len(messages)}\n"
-                            f"🕐 {datetime.now().strftime('%d/%m %H:%M')}",
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
-                else:
-                    log.error(f"❌ Topic#{tid} forward xatosi: {err}")
-                    # last_time ni yangilamaymiz — keyingi siklda qayta uriadi
-                    try:
-                        await bot.send_message(
-                            ADMIN_ID,
-                            f"❌ <b>{topic['name']}</b> yuborilmadi:\n<code>{err}</code>",
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
+                # Yuborildi deb belgilaymiz (hatto qisman bo'lsa ham — qayta
+                # yubormaslik uchun; xatolarni adminga aytamiz)
+                scheduler_state[tid] = {"last_time": now}
+
+                # Adminga hisobot
+                try:
+                    report = (
+                        f"📤 <b>{topic['name']}</b>\n"
+                        f"🎯 {topic['url']}\n"
+                        f"✅ Yuborildi: {sent} ta"
+                    )
+                    if failed:
+                        report += f"\n❌ Xato: {failed} ta\n<code>{last_err}</code>"
+                    report += f"\n🕐 {tk_now.strftime('%d/%m %H:%M')} (Tashkent)"
+                    await bot.send_message(ADMIN_ID, report, parse_mode="HTML")
+                except Exception:
+                    pass
 
         except Exception as e:
             log.error(f"Scheduler xatosi: {e}")
 
-        await asyncio.sleep(60)  # Har daqiqada tekshir
+        # Har 30 soniyada tekshir (daqiqa oynasini o'tkazib yubormaslik uchun)
+        await asyncio.sleep(30)
 
 
 # ── KEEP-ALIVE — bot + userbot uxlamasligi uchun ──────────────────────────────
